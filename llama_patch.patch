@@ -1,0 +1,463 @@
+diff --git a/Makefile b/Makefile
+index c568dd0..9b7aa9b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -816,6 +816,26 @@ embedding: examples/embedding/embedding.cpp                   ggml.o llama.o $(C
+ 	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
+ 	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+ 
++
++# Adding embedding_main to test
++# Assuming embedding_main.cpp is in the directory examples/embedding/
++# and that it reuses the same configuration and libraries as other targets
++
++# Define specific compiler and linker flags for embedding_main
++EMBEDDING_CXXFLAGS = $(CXXFLAGS) -I/usr/local/include
++EMBEDDING_LDFLAGS = $(LDFLAGS) -L/usr/local/lib64 -laws-lambda-runtime -lcjson -lcurl -lpthread
++
++embedding_lib.o: examples/embedding/embedding_lib.cpp ggml.o llama.o $(COMMON_DEPS) $(OBJS)
++	$(CXX) $(EMBEDDING_CXXFLAGS) -c $< -o $@
++
++embedding_main.o: examples/embedding/embedding_main.cpp embedding_lib.o ggml.o llama.o $(COMMON_DEPS) $(OBJS)
++	$(CXX) $(EMBEDDING_CXXFLAGS) -c $< -o $@
++
++embedding_main: embedding_main.o embedding_lib.o ggml.o llama.o $(COMMON_DEPS) $(OBJS)
++	$(CXX) $^ -o $@ $(EMBEDDING_LDFLAGS)
++
++# End of embedding_main
++
+ gritlm: examples/gritlm/gritlm.cpp                         ggml.o llama.o $(COMMON_DEPS) $(OBJS)
+ 	$(CXX) $(CXXFLAGS) -c $< -o $(call GET_OBJ_FILE, $<)
+ 	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS)
+diff --git a/examples/embedding/LambdaLogger.h b/examples/embedding/LambdaLogger.h
+new file mode 100644
+index 0000000..f5f5777
+--- /dev/null
++++ b/examples/embedding/LambdaLogger.h
+@@ -0,0 +1,63 @@
++#ifndef LAMBDA_LOGGER_H
++#define LAMBDA_LOGGER_H
++
++#include <iostream>  // Include for standard I/O operations
++#include <sstream>   // Include for string stream operations
++#include <vector>    // Include for using std::vector
++#include <string>    // Include for using std::string
++
++// LogLevel enum to define the severity levels of logging
++enum class LogLevel {
++    DEBUG,   // Level for detailed debug information
++    INFO,    // Level for informational messages
++    ERROR    // Level for error messages
++};
++
++// LambdaLogger class to handle logging within AWS Lambda functions
++class LambdaLogger {
++public:
++    // Constructor initializes the logger with a default log level of INFO
++    LambdaLogger() : currentLevel_(LogLevel::INFO) {}
++
++    // Logs a message at the specified log level with a request ID
++    void log(LogLevel level, const std::string& requestId, const std::string& message) {
++        if (level < currentLevel_) return;  // Ignore messages below the current log level
++        std::cout << toString(level) << "\t"  // Output the log level as a string
++                  << "RequestId: " << requestId << "\t"  // Output the request ID
++                  << message << std::endl;  // Output the log message
++    }
++
++    // Logs vector embedding
++    void log(LogLevel level, const std::string& request_id, const std::vector<float>& data, const std::string& prefix = "Embeddings: ") {
++        if (level < currentLevel_) return;  // Ignore messages below the current log level
++        std::cout << toString(level) << "\t"
++                << "RequestId: " << request_id << "\t"
++                << prefix << "Count: " << data.size() << " - Values: ";
++        for (float value : data) {
++            std::cout << value << " ";
++        }
++        std::cout << std::endl;
++    }
++
++
++
++    // Sets the current log level of the logger
++    void setLevel(LogLevel level) {
++        currentLevel_ = level;  // Update the log level to the new value
++    }
++
++private:
++    // Converts a LogLevel to its corresponding string representation
++    std::string toString(LogLevel level) const {
++        switch (level) {
++            case LogLevel::DEBUG: return "DEBUG";  // Return "DEBUG" for LogLevel::DEBUG
++            case LogLevel::INFO:  return "INFO";   // Return "INFO" for LogLevel::INFO
++            case LogLevel::ERROR: return "ERROR";  // Return "ERROR" for LogLevel::ERROR
++            default:              return "INFO";   // Default to "INFO" if no match
++        }
++    }
++
++    LogLevel currentLevel_;  // Stores the current log level of the logger
++};
++
++#endif // LAMBDA_LOGGER_H
+diff --git a/examples/embedding/embedding_lib.cpp b/examples/embedding/embedding_lib.cpp
+new file mode 100644
+index 0000000..6e6e987
+--- /dev/null
++++ b/examples/embedding/embedding_lib.cpp
+@@ -0,0 +1,217 @@
++#include "common.h"
++#include "llama.h"
++#include <vector>
++#include <ctime>
++
++#if defined(_MSC_VER)
++#pragma warning(disable: 4244 4267) // possible loss of data
++#endif
++
++static std::vector<std::string> split_lines(const std::string & s) {
++    std::string line;
++    std::vector<std::string> lines;
++    std::stringstream ss(s);
++    while (std::getline(ss, line)) {
++        lines.push_back(line);
++    }
++    return lines;
++}
++
++static void batch_add_seq(llama_batch & batch, const std::vector<int32_t> & tokens, int seq_id) {
++    for (size_t i = 0; i < tokens.size(); i++) {
++        llama_batch_add(batch, tokens[i], i, { seq_id }, i == tokens.size() - 1);
++    }
++}
++
++
++static void batch_decode(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd) {
++    // clear previous kv_cache values (irrelevant for embeddings)
++    llama_kv_cache_clear(ctx);
++
++    // run model
++    fprintf(stderr, "%s: n_tokens = %d, n_seq = %d\n", __func__, batch.n_tokens, n_seq);
++    if (llama_decode(ctx, batch) < 0) {
++        fprintf(stderr, "%s : failed to decode\n", __func__);
++    }
++
++    for (int i = 0; i < batch.n_tokens; i++) {
++        if (!batch.logits[i]) {
++            continue;
++        }
++
++        // try to get sequence embeddings - supported only when pooling_type is not NONE
++        const float * embd = llama_get_embeddings_seq(ctx, batch.seq_id[i][0]);
++        if (embd == NULL) {
++            embd = llama_get_embeddings_ith(ctx, i);
++            if (embd == NULL) {
++                fprintf(stderr, "%s: failed to get embeddings for token %d\n", __func__, i);
++                continue;
++            }
++        }
++
++        float * out = output + batch.seq_id[i][0] * n_embd;
++        llama_embd_normalize(embd, out, n_embd);
++    }
++}
++
++// int main(int argc, char ** argv) {
++std::vector<float> run_embedding(int argc, char ** argv) {
++     // Redirect stdout and stderr to /dev/null
++    freopen("/dev/null", "w", stdout);
++    freopen("/dev/null", "w", stderr);
++
++    gpt_params params;
++
++    if (!gpt_params_parse(argc, argv, params)) {
++        return std::vector<float>();
++    }
++
++    params.embedding = true;
++    // For non-causal models, batch size must be equal to ubatch size
++    params.n_ubatch = params.n_batch;
++
++    //print_build_info();
++
++    if (params.seed == LLAMA_DEFAULT_SEED) {
++        params.seed = time(NULL);
++    }
++
++    //fprintf(stderr, "%s: seed  = %u\n", __func__, params.seed);
++
++    std::mt19937 rng(params.seed);
++    if (params.random_prompt) {
++        params.prompt = gpt_random_prompt(rng);
++    }
++
++    llama_backend_init();
++    llama_numa_init(params.numa);
++
++    llama_model * model;
++    llama_context * ctx;
++
++    // load the model
++    std::tie(model, ctx) = llama_init_from_gpt_params(params);
++    if (model == NULL) {
++        fprintf(stderr, "%s: error: unable to load model\n", __func__);
++        return std::vector<float>();
++    }
++
++    const int n_ctx_train = llama_n_ctx_train(model);
++    const int n_ctx = llama_n_ctx(ctx);
++
++    if (n_ctx > n_ctx_train) {
++        fprintf(stderr, "%s: warning: model was trained on only %d context tokens (%d specified)\n",
++                __func__, n_ctx_train, n_ctx);
++    }
++
++    // print system information
++    // {
++    //     fprintf(stderr, "\n");
++    //     fprintf(stderr, "%s\n", get_system_info(params).c_str());
++    // }
++
++    // split the prompt into lines
++    std::vector<std::string> prompts = split_lines(params.prompt);
++
++    // max batch size
++    const uint64_t n_batch = params.n_batch;
++    GGML_ASSERT(params.n_batch >= params.n_ctx);
++
++    // tokenize the prompts and trim
++    std::vector<std::vector<int32_t>> inputs;
++    for (const auto & prompt : prompts) {
++        auto inp = ::llama_tokenize(ctx, prompt, true, false);
++        if (inp.size() > n_batch) {
++            fprintf(stderr, "%s: error: number of tokens in input line (%lld) exceeds batch size (%lld), increase batch size and re-run\n",
++                    __func__, (long long int) inp.size(), (long long int) n_batch);
++            return std::vector<float>();
++        }
++        inputs.push_back(inp);
++    }
++
++    // add SEP if not present
++    for (auto & inp : inputs) {
++        if (inp.empty() || inp.back() != llama_token_sep(model)) {
++            inp.push_back(llama_token_sep(model));
++        }
++    }
++
++    // tokenization stats
++    if (params.verbose_prompt) {
++        for (int i = 0; i < (int) inputs.size(); i++) {
++            fprintf(stderr, "%s: prompt %d: '%s'\n", __func__, i, prompts[i].c_str());
++            fprintf(stderr, "%s: number of tokens in prompt = %zu\n", __func__, inputs[i].size());
++            for (int j = 0; j < (int) inputs[i].size(); j++) {
++                fprintf(stderr, "%6d -> '%s'\n", inputs[i][j], llama_token_to_piece(ctx, inputs[i][j]).c_str());
++            }
++            fprintf(stderr, "\n\n");
++        }
++    }
++
++    // initialize batch
++    const int n_prompts = prompts.size();
++    struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
++
++    // allocate output
++    const int n_embd = llama_n_embd(model);
++    std::vector<float> embeddings(n_prompts * n_embd, 0);
++    float * emb = embeddings.data();
++
++    // break into batches
++    int p = 0; // number of prompts processed already
++    int s = 0; // number of prompts in current batch
++    for (int k = 0; k < n_prompts; k++) {
++        // clamp to n_batch tokens
++        auto & inp = inputs[k];
++
++        const uint64_t n_toks = inp.size();
++
++        // encode if at capacity
++        if (batch.n_tokens + n_toks > n_batch) {
++            float * out = emb + p * n_embd;
++            batch_decode(ctx, batch, out, s, n_embd);
++            llama_batch_clear(batch);
++            p += s;
++            s = 0;
++        }
++
++        // add to batch
++        batch_add_seq(batch, inp, s);
++        s += 1;
++    }
++
++    // final batch
++    float * out = emb + p * n_embd;
++    batch_decode(ctx, batch, out, s, n_embd);
++
++    // print the first part of the embeddings or for a single prompt, the full embedding
++    // fprintf(stdout, "\n");
++    // for (int j = 0; j < n_prompts; j++) {
++    //     fprintf(stdout, "embedding %d: ", j);
++    //     for (int i = 0; i < (n_prompts > 1 ? std::min(16, n_embd) : n_embd); i++) {
++    //         fprintf(stdout, "%9.6f ", emb[j * n_embd + i]);
++    //     }
++    //     fprintf(stdout, "\n");
++    // }
++
++    // print cosine similarity matrix
++    // if (n_prompts > 1) {
++    //     fprintf(stdout, "\n");
++    //     printf("cosine similarity matrix:\n\n");
++    //     for (int i = 0; i < n_prompts; i++) {
++    //         for (int j = 0; j < n_prompts; j++) {
++    //             float sim = llama_embd_similarity_cos(emb + i * n_embd, emb + j * n_embd, n_embd);
++    //             fprintf(stdout, "%6.2f ", sim);
++    //         }
++    //         fprintf(stdout, "\n");
++    //     }
++    // }
++
++    // clean up
++    // llama_print_timings(ctx);
++    llama_free(ctx);
++    llama_free_model(model);
++    llama_backend_free();
++
++    return embeddings;
++}
+diff --git a/examples/embedding/embedding_lib.h b/examples/embedding/embedding_lib.h
+new file mode 100644
+index 0000000..31fa61b
+--- /dev/null
++++ b/examples/embedding/embedding_lib.h
+@@ -0,0 +1,11 @@
++#ifndef EMBEDDING_H
++#define EMBEDDING_H
++
++#include "llama.h"  // Assuming llama.h contains necessary type definitions
++#include "common.h"
++#include <vector>  // Include the vector header
++
++// Change the return type of the function to vector of floats
++std::vector<float> run_embedding(int argc, char ** argv);
++
++#endif // EMBEDDING_H
+diff --git a/examples/embedding/embedding_main.cpp b/examples/embedding/embedding_main.cpp
+new file mode 100644
+index 0000000..7bbdd7e
+--- /dev/null
++++ b/examples/embedding/embedding_main.cpp
+@@ -0,0 +1,116 @@
++#include <aws/lambda-runtime/runtime.h>
++#include <cjson/cJSON.h>
++#include <cstring>
++#include <memory>
++#include <cstdlib>
++#include <iostream>
++#include "embedding_lib.h"  // Include the embedding library
++#include "LambdaLogger.h"
++
++struct cJSON_Deleter {
++    void operator()(cJSON* ptr) const { cJSON_Delete(ptr); }
++};
++
++using cJSON_ptr = std::unique_ptr<cJSON, cJSON_Deleter>;
++using namespace aws::lambda_runtime;
++
++void configure_logger_from_environment(LambdaLogger& logger) {
++    const char* env_log_level = std::getenv("LOG_LEVEL");
++    if (env_log_level != nullptr) {
++        std::string log_level_str(env_log_level);
++        if (log_level_str == "DEBUG") logger.setLevel(LogLevel::DEBUG);
++        else if (log_level_str == "ERROR") logger.setLevel(LogLevel::ERROR);
++        else logger.setLevel(LogLevel::INFO);
++    }
++}
++
++
++static invocation_response my_handler(invocation_request const& req) {
++    LambdaLogger logger;
++    configure_logger_from_environment(logger);
++
++    cJSON_ptr root(cJSON_CreateObject(), cJSON_Deleter());
++    cJSON_ptr payload_json(nullptr, cJSON_Deleter());
++
++    try {
++        logger.log(LogLevel::INFO, req.request_id, "X-Ray Trace ID: " + std::string(req.xray_trace_id));
++
++        payload_json.reset(cJSON_Parse(req.payload.c_str()));
++        if (!payload_json) {
++            return invocation_response::failure("Invalid or corrupted JSON payload.", "JSONParseError");
++        }
++
++        cJSON* text_item = cJSON_GetObjectItem(payload_json.get(), "text");
++        if (!text_item || text_item->type != cJSON_String || strlen(text_item->valuestring) >= 4028) {
++            return invocation_response::failure("The 'text' key does not exist or string exceeds length limit.", "DataValidationError");
++        }
++        const char* text = text_item->valuestring;
++        logger.log(LogLevel::INFO, req.request_id, "text: " + std::string(text));
++
++        int argc = 9;
++        const char* const_argv[] = {
++            "embedding",
++            "-m", "/app/nomic-embed-text-v1.5.Q8_0.gguf",
++            "-c", "2048",
++            "-b", "2048",
++            "-p", text,
++            nullptr
++        };
++        char** argv = const_cast<char**>(const_argv);
++        std::vector<float> embeddings = run_embedding(argc, argv);
++        logger.log(LogLevel::INFO, req.request_id, "Received embeddings count: " + std::to_string(embeddings.size()));
++        //logger.log(LogLevel::INFO, req.request_id, embeddings);
++
++        if (embeddings.empty()) {
++            return invocation_response::failure("Failed to get embeddings.", "EmbeddingError");
++        }
++
++        cJSON* embeddingsArray = cJSON_CreateArray();
++        for (auto& emb : embeddings) {
++            cJSON_AddItemToArray(embeddingsArray, cJSON_CreateNumber(emb));
++        }
++        cJSON_AddItemToObject(root.get(), "embeddings", embeddingsArray);
++
++        std::unique_ptr<char, decltype(&free)> response_payload(cJSON_Print(root.get()), free);
++        return invocation_response::success(response_payload.get(), "application/json");
++    } catch (const std::exception& e) {
++        return invocation_response::failure(e.what(), "ExceptionError");
++    }
++}
++
++int main() {
++    run_handler(my_handler);
++    return 0;
++}
++
++// int main() {
++//     const char* text = "Hello, goodbye!";
++//     int argc = 9; // Including the program name
++//     const char* const_argv[] = {
++//         "embedding",
++//         "-m", "/app/nomic-embed-text-v1.5.Q8_0.gguf",
++//         "-c", "2048",
++//         "-b", "2048",
++//         "-p", text,
++//         nullptr  // Correct null terminator for argv
++//     };
++
++//     // Unsafe cast, but necessary under the current constraints
++//     char** argv = const_cast<char**>(const_argv);
++
++//     std::vector<float> embeddings = run_embedding(argc, argv);
++//     if (embeddings.empty()) {
++//         std::cerr << "Failed to get embeddings." << std::endl;
++//         return 1;
++//     }
++
++//     // Example of processing the embeddings
++//     std::cout << "Received " << embeddings.size() << " embeddings:" << std::endl;
++//     for (size_t i = 0; i < embeddings.size(); ++i) {
++//         std::cout << embeddings[i] << " ";
++//         if ((i + 1) % 10 == 0) std::cout << std::endl;  // New line every 10 values for readability
++//     }
++//     std::cout << std::endl;
++
++//     return 0;
++// }
+

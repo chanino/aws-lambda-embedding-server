@@ -1,0 +1,12 @@
+# Ignore specific files
+nomic-embed-text-v1.5.Q8_0.gguf
+outputfile.txt
+cmake.tar.gz
+
+# Ignore all .bak files
+*.bak
+
+# Ignore all files in specific directory
+llama.cpp/
+aws-lambda-cpp/
+cJSON/
