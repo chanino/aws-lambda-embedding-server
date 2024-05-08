@@ -1,14 +1,14 @@
 # aws-lambda-embedding-server
-Serve embeddings using llama.cpp running on AWS Lambda
 
-This repository deploys an AWS Lambda function that serves embeddings from [nomic-ai/nomic-embed-text-v1.5-GGUF](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf) using [llama.cpp](https://github.com/ggerganov/llama.cpp.git) and a custom Lambda runtime environment (using [aws-lambda-cpp](https://github.com/awslabs/aws-lambda-cpp.git)). llama.cpp is patched to facilitate this change.
+This repository deploys an AWS Lambda function that serves embeddings using [llama.cpp](https://github.com/ggerganov/llama.cpp.git). The embeddings are from [nomic-ai/nomic-embed-text-v1.5-GGUF](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/).  The solution runs in a custom AWS Lambda C++ runtime environment, utilizing [aws-lambda-cpp](https://github.com/awslabs/aws-lambda-cpp.git). This repository includes a patch for llama.cpp to facilitate this implementation.
+
 
 ## Prerequisites
 Before starting, ensure you have the following installed:
-- **AWS CLI**: [Installation guide](https://aws.amazon.com/cli/)
+- **AWS Command Line Interface (CLI)**: [Installation guide](https://aws.amazon.com/cli/)
 - **Docker**: [Installation guide](https://docs.docker.com/get-docker/)
 - **Git**: [Installation guide](https://git-scm.com/book/en/v2/Getting-Started-Installing-Git)
-- **An active AWS account**: Ensure you have the necessary permissions to create and manage AWS Lambda functions, IAM roles, and ECR repositories.
+- **An active AWS account**: Ensure you have the necessary permissions to create and manage AWS Lambda functions, AWS Identity and Access Management (IAM) roles, and Elastic Container Registry (ECR) repositories.
 
 
 ## Installation and Setup
@@ -36,7 +36,7 @@ cd ..
 ```
 
 Authenticate to AWS
-The examples below are based on authenticating via aws configure sso.  `aws configure sso` returns the CLI profile name-  update the PROFILE below with the actual CLI profile name.
+The examples below are based on authenticating via `aws configure sso` that returns the CLI profile name. Update the PROFILE below with the actual CLI profile name.
 
 ```bash
 aws configure sso
@@ -48,21 +48,21 @@ export REGION="us-east-1"
 export AWS_ACCOUNT="123456789123"
 ```
 
-Logon to docker ECR 
+Log in to Docker ECR: This command logs you into the AWS Elastic Container Registry, allowing Docker to push images to your AWS account.
 ``` bash
-aws ecr get-login-password --region $REGION --profile $PROFILE | docker login --username AWS --password-stdin $AWS_ACCOUNT.dkr.ecr.$REGION.amazonaws.com
+aws ecr get-login-password --region $REGION --profile $PROFILE \
+    | docker login --username AWS --password-stdin $AWS_ACCOUNT.dkr.ecr.$REGION.amazonaws.com
 ```
 
-Set docker ECR REPO name
+Set the Docker ECR repository name
 ``` bash
 export REPO="my-lambda-repo"
 ```
 
-If needed, create the ECR repository:
+If needed, create the ECR repository: The `aws ecr create-repository` command outputs a repository URI, which you'll need for tagging and pushing your Docker images. Copy this URI and set it in the `REPO_URI` variable as shown below:
 ```bash
 aws ecr create-repository --repository-name $REPO --region $REGION --profile $PROFILE
 ```
-This command returns the repository uri- note this and use it in the below REPO_URI variable.
 
 ``` bash
 export REPO_URI="123456789123.dkr.ecr.us-east-1.amazonaws.com/my-lambda-repo"
@@ -82,10 +82,7 @@ docker tag ${CONTAINER}:latest ${REPO_URI}:latest
 docker push ${REPO_URI}:latest
 ```
 
-If needed, create an IAM role and attach policy for Lambda execution:
-
-The `trust-policy.json` file in the scripts directory provides an example IAM role for Lambda execution. Review and adjust as needed for your environment.
-
+If needed, create an IAM role and attach policy for Lambda execution: These commands create an IAM role for your Lambda function and attach a basic execution role policy to it, allowing your function to log to AWS CloudWatch.
 ``` bash
 aws iam create-role --role-name lambda-execution-role \
     --assume-role-policy-document file://scripts/trust-policy.json \
@@ -111,7 +108,7 @@ aws lambda create-function --function-name "$FUNCTION_NAME" \
     --architectures arm64
 ```
 
-Adjust memory and timeout settings as needed. This example sets the memory to 3584 and the timeout to 30 seconds.
+Adjust memory and timeout settings as needed. This example sets the memory to 3584 and the timeout to 30 seconds which appears to have reasonable performance.
 ```bash
 aws lambda update-function-configuration --function-name "$FUNCTION_NAME" \
     --memory-size 3584 \
@@ -119,8 +116,8 @@ aws lambda update-function-configuration --function-name "$FUNCTION_NAME" \
     --profile $PROFILE
 ```
 
-With the above steps in place, the base system is in place.
-If edits are made, the following steps automate the build of the image, pushing the image to ECR, updating the lambda, and testing the lamba.  
+Once the above steps are complete, you have a basic system setup. Subsequent edits will require rebuilding the image, pushing updates to ECR, and redeploying the Lambda function for testing.
+
 ```bash
 docker build -t $CONTAINER .
 docker run --rm $CONTAINER
@@ -137,6 +134,14 @@ aws lambda invoke --function-name "$FUNCTION_NAME" \
     --profile "$PROFILE"
 
 cat outputfile.txt
+```
+
+### **Example Outputs**
+
+``` bash
+cat outputfile.txt 
+{
+	"embeddings":	[0.019825341179966927, -0.001809855573810637, -0.157482385635376, -0.012203040532767773, -0.018775740638375282, 0.061870444566011429, -0.00560819637030363, -0.015151900239288807, -0.0060309148393571377, -0.03899509459733963, 0.013224018737673759, 0.07205885648727417, 0.021414058282971382, 0.051344819366931915, 0.027023833245038986, -0.061590474098920822, 0.00785094127058983, -0.06330321729183197, -0.0315524898469448, 0.024848684668540955, -0.036830499768257141, -0.0846926048398018, 0.0065852273255586624, 0.020098078995943069, 0.12245520949363708, 0.0047542448155581951, -0.039120964705944061, 0.072023838758468628, 0.015099567361176014, -0.00506761996075511, ...
 ```
 
 Please refer to individual files for more detailed information about their functionalities and configurations.
